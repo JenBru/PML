@@ -1,0 +1,11 @@
+base
+lattice
+ggplot2
+caret
+plyr
+gridExtra
+randomForest
+nnet
+rpart
+mlbench
+adabag
