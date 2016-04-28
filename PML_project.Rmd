@@ -1,0 +1,190 @@
+---
+title: 'Practical Machine Learning Project: Weight Lifting Excercise Dataset '
+author: "JenBru"
+date: "April 26, 2016"
+output:
+  html_document: default
+  fig_width: 5
+  pdf_document: null
+fontsize: 10pt
+fig_height: 3
+---
+    
+## Executive Summary    
+Data about personal activity can be collected relatively inexpensively using devices such as Fitbit, or Nike FuelBand. These data can be used to monitor amounts of activity as well as quantifying how well an activity is performed.  This project analyzes 6 participants' barbell lift excercises based on data from devices worn on the belt, arm, and dumbbell.  The participants performed the lifts both correctly and in each of 4 different incorrect ways, which included elbows front, lift halfway, lower halfway, and hips in front.  This study aims to correctly classify how participants performed the lifts.  The data includes measures of position in the x, y, and z axes as measured from the device's accelerometer, gyroscope, and magnetometer as well as rotation measures that indicate movement from front to back (roll), side to side (pitch), and around a vertical axis (yaw). 
+
+Several prediction methods and features were tested to try to find a strong predicting algorithm to correctly classify the lift.  The boosted random forest model performed well, which is encouraging as a potential application of sensor data to measure quality and not just quantity of activity.  
+```{r,echo=FALSE,message=FALSE}
+library(caret)
+library(plyr)
+library(gridExtra) 
+library(randomForest)
+library(nnet)
+library(adabag)
+```  
+
+## Data  
+The training and testing data were obtained online from the fileUrls referenced below.  The train data contained 19,622 observations on 160 variables.  Many of these variables were derived measures and had a lot of missing observations.  Rather than impute the derived measures, this study focused on the measures that were collected directly from the device, as well as markers for the participant that performed the lift, and 2 different time stamp indicators.  A list of the measures considered for the analyis are in appendix A.
+```{r,echo=FALSE}
+# set working directory
+setwd("C:/Users/Jen/Documents/coursera/8ml/work/project")
+```
+```{r,cache=TRUE,tidy=TRUE}
+fileUrl<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(fileUrl, destfile="pml-training.csv")
+fileUrl<-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(fileUrl, destfile="pml-testing.csv")
+
+train<-read.csv("pml-training.csv")
+test<-read.csv("pml-testing.csv")
+```  
+
+It seemed that the variable "classe", the classifier that we are interested in categorizing, was a hidden variable, meaning that it can be tabulated and referenced, but it does not appear in the list of global variables.  This was problematic when subsetting the data because it was dropped out.  As such, the following work-around was used.
+```{r,tidy=TRUE}
+trainSmall<-train[,c(2,5,7:10,37:48,60:68,84:86)] # mark columns of interest & put in new df
+classe<-as.character(train$classe) # extract (as text) the "classe" variable from train data
+trainNew<-cbind(trainSmall,classe) # lastly, do cbind to add classe back in
+```  
+
+Next, the training data was split into two subsets: one for training and one for cross-validation. Sixty percent of the data is retained for training.  The createDataPartition function in the caret package is used to create the subsets using random sampling within the levels of "classe" to try to balance the distribution within the subsets.  
+```{r,tidy=TRUE,cache=TRUE}
+trainIndex = createDataPartition(trainNew$class, p = 0.6,list=FALSE)
+training = trainNew[trainIndex,]
+testing = trainNew[-trainIndex,]
+dim(training); dim(testing)
+```  
+
+## Exploratory Data Analysis  
+To get a sense of the data, some basic analysis was done to check for missing data, and look at means and correlations. Begin by getting some basic summary stats, like mean, by classe.  These are computed using the ddply function in the plyr package. The same method was used to look at and compute standard deviations and check for missing values, of which there were none. 
+```{r}
+# mean:
+names<-colnames(training)
+classe<-c("A","B","C","D","E")
+meansTrain<-as.data.frame(classe)
+v<-c(3:30)
+
+fun<-function(variableToSum,i=1:160){ 
+    for(i in v) {
+        var<-names[i]
+        training$var<-training[,var]
+        means<-ddply(training, c("classe"), summarise, mean=mean(var,na.rm=TRUE))  
+        df<-as.data.frame(means[,2])
+        colnames(df)<-var      
+        meansTrain<<-cbind(meansTrain,df)  
+    }
+}    
+fun(names) 
+```  
+Based on the means by classe computed above, one can observe that the average values for some measures are quite different when performing the lift correctly versus in one of the 4 incorrect ways. A few of the means for such cases are shown below. 
+```{r}
+meansTrain[,c(1,21,22,24,25,26)]
+```  
+Kruskal-Wallis rank sum tests confirmed significant differences among classes for the 5 variables shown above as well as several others.  
+  
+Next, some plots were generated to get a feeling for the distribution of the data, by classe, as well as any possible correlations among potential regressors.  A few examples for these plots are shown below for the variables roll_belt, pitch_belt and yaw_belt (figure 1). A plot of the timestamp versus some variables showed interesting cyclical patterns for some variables, including roll_belt (figure 2).   
+```{r, cache=TRUE,tidy=TRUE}
+p1<-ggplot(training, aes(x=classe, y=roll_belt, color=classe)) + geom_point(shape=1, position=position_jitter(width=1,height=.5))+ ggtitle("roll_belt")+ theme(legend.position="none")
+p2<-ggplot(training, aes(x=classe, y=yaw_belt, color=classe)) + geom_point(shape=1, position=position_jitter(width=1,height=.5))+ ggtitle("yaw_belt")+ theme(legend.position="none")
+p3<-ggplot(training, aes(x=classe, y=pitch_belt, color=classe)) + geom_point(shape=1, position=position_jitter(width=1,height=.5))+ ggtitle("pitch_belt")
+grid.arrange(p1, p2, p3, ncol=3, nrow =1, top = "Figure 1. Distribution by classe, Selected Variables", widths=c(4,4,5),heights=c(3))
+qplot(cvtd_timestamp,roll_belt,data=training,color=classe, geom="jitter",main="Figure 2. cvtd_timestamp vs. roll_belt")
+```   
+
+In  addition, a correlation matrix was generated to examine correlation coefficients among potential regressors.  The first 5 rows and columns of the matrix is shown below.  A few potential regressors had somewhat high correlations, which may require more attention when selecting features.    
+```{r,cache=TRUE}
+corMatrix<-as.data.frame(cor(training[,c(3:30)]))
+corMatrix[c(1:5),c(1:5)]
+```  
+
+
+## Model Development 
+The key decisions made in the development of the model to predict classe were feature selection and estimation method.   
+
+### Feature Selection  
+The features were chosen to focus on those without a lot of missing values and were limited to those that were primarily derived directly from the device  rather than summary statistics of those measures (eg. means, min, max, kurtosis, variance, standard deviation). ( See appendix A for a list of the variables considred for use in the model,which are referenced as "."" in the models that follow in this section.) A single timestamp variable (cvtd_timestamp) was selected for inclusion and was found to be a very important predictor.  Variables with low importance, as indicated by the mean gini coefficient, were excluded and several of these were noted to have high correlations with other regressors.  
+
+### Estimation method  
+The analysis began with a random forest method due to its reputation as a high performing prediction model, though it is sometimes lacking in interpretability.  A multinomial logit was also tested, as a potentially more interpretable alternative, but it was ultimately found to be a weak predictor.  Lastly, a boosted random forest method was tested to try to improve prediction accuracy.  
+
+### Model Development  
+#### Random Forest
+We begin by testing a random forest model using all available regressors  based on device measurements in our training data (see appendix A).  The randomForest function from the randomForest package is used. The randomForest function was used rather than caret due to the very long processing times used by caret to fit the model, which ran for hours without converging to a solution for a single model.
+```{r,cache=TRUE,message=FALSE,results="hide"}
+rf1<-randomForest(classe~.,data=training)
+rf1
+```
+```{r,cache=TRUE}
+importance(rf1)
+```
+The data by classe appeared to cluster in certain timestamp intervals for roll_belt, yaw_belt, and pitch_belt when those variables were plotted against the time stamp indicator cvtd_timestamp, as seen in figure 2 above. Due to these patterns and the overwhelming importance of the cvtd_timestamp variable found in our base specification,  dummy variables derived from cvtd_timestamp were interacted with the 3 belt measures of movement (yaw, roll, and pitch), which were the next most important variables.  These interactions were included in the model, but this produced slightly worse results.  
+  
+Alternative random forest models that were tested primarily focused on removing single variables that had correlations with 1 or more other variables of .75 or higher (specifically, magnet_arm_y, magnet_arm_z, accel_arm_y, accel_belt_z,gyros_arm_x, gyros_arm_y, accel_belt_y, and accel_belt_x.)  None of these improved accuracy in prediction.    
+
+Finally, a model was tested that removed those variables with MeanDecreaseGini values, which were derived from the randomForest package's importance function, of less than 100.  The removed variables were: gyros_belt_x, gyros_belt_y, accel_belt_x, accel_belt_y, gyros_arm_x, gyros_arm_y, gyros_arm_z, accel_arm_z,data=training.  Some of these had been earlier noted as having high correlations with other variables. This model is a slight improvement over earlier ones, and will be used as the preferred specification for feature inclusion.
+```{r, cache=TRUE, tidy=TRUE}
+rf2<-randomForest(classe~.-gyros_belt_x-gyros_belt_y-accel_belt_x-accel_belt_y-gyros_arm_x-gyros_arm_y-gyros_arm_z-accel_arm_z,data=training)
+rf2
+predictRF2<-predict(rf2,newdata=testing,type="class")
+confusionMatrix(predictRF2,testing$classe)
+```  
+
+#### Multinomial logit  
+In addition to testing alternative specifications of a random forest model, a multinomial logit was also tested using the multinom function of the nnet package.  The results were much less accurate at predicting classe than the random forest model.    
+```{r, results="hide", message=FALSE,cache=TRUE}
+    mn1<-multinom(classe~.-gyros_belt_x-gyros_belt_y-accel_belt_x-accel_belt_y-gyros_arm_x-gyros_arm_y-gyros_arm_z-accel_arm_z,data=training)
+```  
+```{r, cache=TRUE}
+    p<-predict(mn1,type="class",newdata=testing)
+    postResample(testing$classe,p)
+```   
+
+#### Boosted Random Forest  
+The last model type that was tested was a boosted model that used the boosting function from the adabag package, which is a boosting model for more than 2 categories.  This model was also tested without the low importance variables noted earlier.  
+```{r, cache=TRUE}
+    b1<-boosting(classe~.-gyros_belt_x-gyros_belt_y-accel_belt_x-accel_belt_y-gyros_arm_x-gyros_arm_y-gyros_arm_z-accel_arm_z,data=training)
+    summary(b1)
+    predictB1<-predict(b1,testing)  
+    # compute accuracy by hand because it does not appear to be readily available
+    cmB1<-as.data.frame(predictB1$confusion)  # put the confusion matrix in a dataframe
+    cmb1TotCorrect<-cmB1[which(cmB1$Predicted.Class==cmB1$Observed.Class),] # subset correct predictions
+    b1AccNum<-sum(cmb1TotCorrect$Freq) # sum correct predictions
+    b1AccDenom<-sum(cmB1$Freq)  # sum all predictions
+    B1Accuracy<-b1AccNum/b1AccDenom # find correct share of total predictions (ie. accuracy)
+    predictB1$confusion
+    predictB1$error
+    B1Accuracy
+```  
+
+## Cross-Validation  
+The cross-validation method used here is a 'holdout' method, which is a special case of k-fold cross validation, essentially with only 1 fold.  As noted earlier, the sample is randomly assigned within each class to either the training or testing set.  For this study, 60% of the data is used for training and 40% for testing, which is a commonly used split.  Cross validation is used to evaluate model performance, particularly out of sample error rates and accuracy.  
+
+  The out of sample error rate, obtained by applying the predction model to the validation data subset of the training set was just 0.0003.  The out of sample accuracy of the boosted randomForest base model was 0.9996, slightly higher than the basic random forest model, which had accuracy of 0.9975, but much higher than that of the multinomial logit model (0.79).  Thus the preferred model is the boosted model with some less important variables, which were detected by rf1 (the original random forest model), removed. The confusion matrix, which shows a cross-tabulation of predictions and actual classifications from the testing (cross-validation) data.  There were very few incorrect predictions in the preferred model. 
+  
+## Model Performance on test set   
+The boosted model with low importance predictors removed model, which was our final preferred model, was appled to the test data, which consisted of 20 test cases.  It correctly predicted all 20 of the test cases.  The strong prediction performance of the model is in line with the high accuracy ratio of the model and low error rates on correctly predicting each category.  
+```{r}
+testB1<-predict(b1,test)  
+quiz<-as.data.frame(testB1$class)   
+```  
+    
+## Discussion and Conclusions  
+The boosted model, limited to the most important variables derived directly from measures from the device sensor, performed well in correctly predicting the test cases.  This is an exciting result, which may encourage more research on classification of activity studies that look at quality, in addition to quantity, of activity.  
+
+
+### Appendix A 
+Variables to be considered in developing the model.
+```{r}
+names
+```  
+
+### Appendix B
+The following packages need to be loaded prior to running the code above.
+```{r,echo=TRUE,message=FALSE,results="hide"}
+library(caret)
+library(plyr)
+library(gridExtra) 
+library(randomForest)
+library(nnet)  
+library(adabag)
+```  
+
